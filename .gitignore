@@ -1,2 +1,5 @@
 market_app
-data/market.csv
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+/data/market.csv
