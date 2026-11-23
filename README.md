@@ -1,83 +1,109 @@
-# Nakuru Fresh Produce Market — Inventory, Order & Dispatch System
+# Nakuru Fresh Produce Market
 
-A small C++17 + HTML/CSS/vanilla JavaScript prototype for the Group 3 Systems Analysis & Design mini-SDLC assignment and a C++ OOP assignment.
-
-## Features
-
-- Single-page browser UI with seven views: dashboard, retailer order, batch intake, driver dispatch, delivery manifest, alerts and sales summary.
-- C++17 domain model demonstrating encapsulation, abstraction, inheritance, polymorphism and composition.
-- FIFO allocation: available batches for a produce item are sorted by earliest expiry date and stock is deducted from the oldest batch first.
-- Input validation for positive quantities, valid retailer/driver/order references, sufficient stock and expiry date after arrival date.
-- Seed data for Kenyan produce, retailers in Section 58/Milimani/Lanet and drivers with Kenyan vehicle registrations.
-- CSV snapshot persistence in `data/market.csv` after mutations.
+A small C++17 + HTML/CSS/vanilla JavaScript prototype for managing produce inventory, retailer orders, dispatches, alerts and daily sales.
 
 ## Requirements
 
-- Ubuntu/Linux with `g++` supporting C++17.
-- No third-party C++ libraries or database server are required. The tiny HTTP server uses Linux/POSIX sockets.
+- Ubuntu/Linux
+- g++ with C++17 support
+- SQLite development library
 
-## Compile and run
+Install the local dependencies:
+
+```bash
+sudo apt update
+sudo apt install -y g++ libsqlite3-dev
+```
+
+## Run locally
 
 From the project directory:
 
 ```bash
-g++ -std=c++17 -O2 main.cpp -o market_app
+g++ -std=c++17 -O2 -Wall -Wextra main.cpp -lsqlite3 -o market_app
 ./market_app
 ```
 
-Open **http://localhost:8080** in your browser. Stop the server with `Ctrl+C`.
+Open http://localhost:8080.
 
-The server expects `index.html` in the current working directory. It creates `data/` automatically and writes `data/market.csv` when an order, batch or dispatch is saved.
+By default, SQLite stores data in `data/market.db`. You can choose another path:
+
+```bash
+DATABASE_PATH=/absolute/path/market.db ./market_app
+```
+
+The server uses port 8080 locally. Set `PORT` to override it.
+
+## Run with Docker
+
+Build and run with a persistent local volume:
+
+```bash
+docker build -t nakuru-market .
+docker run --rm -p 8080:10000 \
+  -e PORT=10000 \
+  -e DATABASE_PATH=/app/data/market.db \
+  -v nakuru-market-data:/app/data \
+  nakuru-market
+```
+
+Open http://localhost:8080.
+
+## Deploy to Render (Free)
+
+This repository includes a `render.yaml` Blueprint and a multi-stage `Dockerfile`.
+
+1. Push the repository to GitHub.
+2. In Render, choose **New → Blueprint**.
+3. Connect this repository and deploy the Blueprint.
+4. Render creates the web service using the Free plan and Dockerfile.
+
+The service listens on Render's assigned `PORT` and exposes `/healthz` as its health check.
+
+### Important: Free-plan data persistence
+
+The Render Free web service has an ephemeral filesystem and no persistent disk. This configuration stores SQLite at `/tmp/nakuru-market.db`, so data survives normal requests and process activity while the instance remains alive, but **can be lost when Render spins the service down, restarts it, or redeploys it**. It is suitable for a class demo, not for reliable production records.
+
+For persistent online data, the app needs a hosted database such as Neon Postgres and a PostgreSQL persistence adapter. That adapter is not included in this SQLite version. Do not assume that changing `DATABASE_PATH` to a Postgres URL will work.
+
+## Features
+
+- Dashboard KPIs for orders, revenue, low stock and expiring batches
+- Inventory and batch intake
+- Retailer orders with FIFO stock allocation by earliest expiry date
+- Driver dispatch and delivery manifest
+- Spoilage / low-stock alerts
+- Daily sales summary
+- SQLite persistence for batches, orders and deliveries
+- `GET /healthz` health-check endpoint
 
 ## API routes
 
 | Method | Route | Purpose |
 |---|---|---|
-| GET | `/api/dashboard` | KPI values |
-| GET | `/api/inventory` | Inventory sorted by expiry date |
-| GET | `/api/products` | Produce list and live available stock |
-| GET | `/api/retailers` | Retailer dropdown data |
-| GET | `/api/orders` | Recorded orders |
-| GET | `/api/drivers` | Driver dropdown data |
-| GET | `/api/manifest` | Driver delivery manifest |
-| GET | `/api/alerts` | Expiry and low-stock exceptions |
-| GET | `/api/sales` | Revenue totals by produce |
-| POST | `/api/orders` | Create an order and allocate FIFO stock |
-| POST | `/api/batches` | Record a new produce batch |
-| POST | `/api/dispatch` | Assign an order to a driver |
+| GET | `/api/dashboard` | Dashboard KPIs |
+| GET | `/api/inventory` | Inventory batches |
+| GET | `/api/products` | Produce catalogue and stock |
+| GET | `/api/retailers` | Retailers |
+| GET | `/api/orders` | Orders |
+| GET | `/api/drivers` | Drivers |
+| GET | `/api/manifest` | Delivery manifest |
+| GET | `/api/alerts` | Expiring and low-stock alerts |
+| GET | `/api/sales` | Daily sales totals |
+| GET | `/healthz` | Render health check |
+| POST | `/api/orders` | Create retailer order |
+| POST | `/api/batches` | Record batch intake |
+| POST | `/api/dispatch` | Dispatch an order |
 
-Example order payload:
+## OOP concepts demonstrated
 
-```json
-{"retailerId":"R001","channel":"WhatsApp","produce":"Tomatoes","quantity":15}
-```
+- **Encapsulation:** domain data is private and validated through constructors and setters.
+- **Abstraction:** `MarketEntity` defines the common `toJson()` and `getSummary()` interface.
+- **Inheritance:** `ProduceBatch`, `Retailer`, `Order` and `Delivery` implement the market entity interface; `Retailer` and `Driver` inherit from `Person`.
+- **Polymorphism:** `ReportGenerator` works with a vector of `MarketEntity*`.
+- **Composition:** `InventoryManager` owns the domain collections and coordinates operations.
+- **FIFO:** orders allocate stock from batches with the earliest expiry date first.
 
-## OOP concept mapping for the C++ report
+## Prototype limitations
 
-| OOP concept | Where it appears | Explanation |
-|---|---|---|
-| Encapsulation | `ProduceBatch`, `Order`, `Retailer`, `Delivery` | Domain data is private. Constructors and setters validate quantities and batch dates before changing state. |
-| Abstraction | `MarketEntity` | Abstract base class defines the common `toJson()` and `getSummary()` interface. |
-| Inheritance | `Retailer : public Person`, `Driver : public Person` | Retailer and Driver reuse the common person identity, name and phone attributes. |
-| Polymorphism | `MarketEntity` subclasses and `ReportGenerator` | `ReportGenerator::render(const vector<MarketEntity*>&)` calls overridden `toJson()` methods through base-class pointers. |
-| Composition | `InventoryManager` | InventoryManager owns the collections of batches, retailers, drivers, orders and deliveries and coordinates their business rules. |
-
-## FIFO business rule
-
-When an order is submitted, the system:
-
-1. Calculates total available stock for the selected produce.
-2. Rejects the order if the requested quantity exceeds available stock.
-3. Sorts eligible batches by `expiryDate` ascending.
-4. Deducts the requested quantity from the earliest-expiring batch, continuing into the next batch only when necessary.
-5. Stores the first allocated batch ID on the order for the demo manifest.
-
-Low stock is reported when the remaining total for a produce category falls below its reorder level. Batches expiring within the next two calendar days are shown in the exception report; date-only prototype data is used rather than hour-level timestamps.
-
-## Prototype boundaries
-
-This is an educational proof of concept, not a production deployment. The HTTP server is intentionally small and single-process. The flat-file CSV snapshot is intended for a local demonstration; it is not a concurrent multi-user database. Authentication, secure password storage, CSRF protection, HTTPS termination, production-grade JSON parsing, database migrations and cloud backups are not implemented. For a production system, use a maintained HTTP framework, a real database, secure authentication and a reverse proxy.
-
-## Assignment alignment
-
-The prototype supports the design documented in the Group 3 analysis: retailer order capture, batch intake with arrival/expiry dates, FIFO stock allocation, dispatch scheduling, a printable manifest, low-stock/spoilage alerts and sales reporting. The project documentation and diagrams remain separate assignment deliverables; this repository supplies the programming prototype and OOP implementation.
+This is an academic demonstration, not a production-ready commerce system. Authentication and authorization, a production-grade HTTP framework, robust JSON parsing, database migrations, automated backups and multi-instance concurrency controls are not implemented. Render Free's ephemeral filesystem can lose SQLite data as described above.
