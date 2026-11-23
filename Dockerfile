@@ -3,7 +3,7 @@ FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends g++ libpq-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY main.cpp index.html ./
-RUN g++ -std=c++17 -O2 -Wall -Wextra main.cpp -lpq -o market_app
+RUN g++ -std=c++17 -O2 -Wall -Wextra main.cpp -pthread -lpq -o market_app
 
 # Runtime stage.
 FROM debian:bookworm-slim
