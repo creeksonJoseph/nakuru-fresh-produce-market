@@ -1,5 +1,2 @@
 market_app
-/data/*.db
-/data/*.db-shm
-/data/*.db-wal
-/data/market.csv
+.env
