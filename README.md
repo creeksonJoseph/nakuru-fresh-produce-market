@@ -7,39 +7,54 @@ A small C++17 + HTML/CSS/vanilla JavaScript prototype for managing produce inven
 - Ubuntu/Linux
 - g++ with C++17 support
 - SQLite development library
+- PostgreSQL client development library (only needed when building with PostgreSQL support)
 
-Install the local dependencies:
+Install dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y g++ libsqlite3-dev
+sudo apt install -y g++ libsqlite3-dev libpq-dev
 ```
 
-## Run locally
-
-From the project directory:
+## Run locally (SQLite)
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra main.cpp -lsqlite3 -o market_app
+g++ -std=c++17 -O2 -Wall -Wextra main.cpp -lsqlite3 -lpq -o market_app
 ./market_app
 ```
 
-Open http://localhost:8080.
+Open http://localhost:8080. By default, data is stored in `data/market.db`.
 
-By default, SQLite stores data in `data/market.db`. You can choose another path:
+You can override the SQLite file path:
 
 ```bash
 DATABASE_PATH=/absolute/path/market.db ./market_app
 ```
 
-The server uses port 8080 locally. Set `PORT` to override it.
+## Use PostgreSQL locally or online
+
+When `DATABASE_URL` is set, the application uses PostgreSQL instead of SQLite. When it is absent, the app uses SQLite.
+
+```bash
+export DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require'
+./market_app
+```
+
+Use the connection string supplied by your database provider. Do not commit it to GitHub or place it in the Dockerfile.
+
+The app creates its three tables automatically on first connection: `batches`, `orders`, and `deliveries`.
 
 ## Run with Docker
 
-Build and run with a persistent local volume:
+Build:
 
 ```bash
 docker build -t nakuru-market .
+```
+
+Run locally with a persistent SQLite volume:
+
+```bash
 docker run --rm -p 8080:10000 \
   -e PORT=10000 \
   -e DATABASE_PATH=/app/data/market.db \
@@ -47,24 +62,32 @@ docker run --rm -p 8080:10000 \
   nakuru-market
 ```
 
-Open http://localhost:8080.
+Or run the container against PostgreSQL:
 
-## Deploy to Render (Free)
+```bash
+docker run --rm -p 8080:10000 \
+  -e PORT=10000 \
+  -e DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require' \
+  nakuru-market
+```
 
-This repository includes a `render.yaml` Blueprint and a multi-stage `Dockerfile`.
+## Deploy to Render
 
-1. Push the repository to GitHub.
-2. In Render, choose **New → Blueprint**.
-3. Connect this repository and deploy the Blueprint.
-4. Render creates the web service using the Free plan and Dockerfile.
+This repository includes a `render.yaml` Blueprint and a Dockerfile configured for Render's Free web service.
 
-The service listens on Render's assigned `PORT` and exposes `/healthz` as its health check.
+1. In Render, open the PostgreSQL database you created.
+2. Copy its **Internal Database URL** if the web service is in the same Render region. If it is in a different region, use the External Database URL.
+3. Open the Nakuru web service → **Environment**.
+4. Add an environment variable:
+   - **Key:** `DATABASE_URL`
+   - **Value:** paste the PostgreSQL connection URL from Render.
+5. Save changes and trigger a deploy if Render does not automatically redeploy.
 
-### Important: Free-plan data persistence
+Do not add the connection URL to the Dockerfile, `render.yaml`, source code, or GitHub. Render injects environment variables into the running service.
 
-The Render Free web service has an ephemeral filesystem and no persistent disk. This configuration stores SQLite at `/tmp/nakuru-market.db`, so data survives normal requests and process activity while the instance remains alive, but **can be lost when Render spins the service down, restarts it, or redeploys it**. It is suitable for a class demo, not for reliable production records.
+The app checks for `DATABASE_URL` at startup. If it is set, it connects to PostgreSQL; otherwise it falls back to local SQLite. The Render database URL should include SSL settings if Render provides them. Render's own connection URL is the source of truth.
 
-For persistent online data, the app needs a hosted database such as Neon Postgres and a PostgreSQL persistence adapter. That adapter is not included in this SQLite version. Do not assume that changing `DATABASE_PATH` to a Postgres URL will work.
+The web service listens on Render's assigned `PORT` and exposes `/healthz` as its health check.
 
 ## Features
 
@@ -74,7 +97,8 @@ For persistent online data, the app needs a hosted database such as Neon Postgre
 - Driver dispatch and delivery manifest
 - Spoilage / low-stock alerts
 - Daily sales summary
-- SQLite persistence for batches, orders and deliveries
+- PostgreSQL persistence when `DATABASE_URL` is set
+- SQLite persistence for local development by default
 - `GET /healthz` health-check endpoint
 
 ## API routes
@@ -106,4 +130,4 @@ For persistent online data, the app needs a hosted database such as Neon Postgre
 
 ## Prototype limitations
 
-This is an academic demonstration, not a production-ready commerce system. Authentication and authorization, a production-grade HTTP framework, robust JSON parsing, database migrations, automated backups and multi-instance concurrency controls are not implemented. Render Free's ephemeral filesystem can lose SQLite data as described above.
+This is an academic demonstration, not a production-ready commerce system. Authentication and authorization, a production-grade HTTP framework, robust JSON parsing, database migrations, automated backups and multi-instance concurrency controls are not implemented.
