@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <ctime>
+#include <filesystem>
+#include <sqlite3.h>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -125,6 +127,7 @@ public:
     string getBatchUsed() const { return batchUsed; } double getQuantity() const { return quantity; }
     double getTotal() const { return total; } double getUnitPrice() const { return unitPrice; }
     void setStatus(const string& s) { status = s; }
+    void setCreatedAt(const string& value) { createdAt = value; }
     string toJson() const override { ostringstream o; o << "{\"id\":"<<jsonString(id)<<",\"retailerId\":"<<jsonString(retailerId)<<",\"channel\":"<<jsonString(channel)<<",\"produce\":"<<jsonString(produce)<<",\"quantity\":"<<quantity<<",\"unitPrice\":"<<unitPrice<<",\"total\":"<<total<<",\"createdAt\":"<<jsonString(createdAt)<<",\"status\":"<<jsonString(status)<<",\"batchUsed\":"<<jsonString(batchUsed)<<"}"; return o.str(); }
     string getSummary() const override { return id + " - " + produce + " x " + to_string((int)quantity); }
 };
@@ -159,8 +162,43 @@ class InventoryManager {
     map<string,double> prices;
     map<string,double> reorderLevels;
     int nextOrder=4, nextBatch=6, nextDelivery=3;
+    sqlite3* db=nullptr;
+    string dbPath;
+    void checkSql(int rc, const string& action) const {
+        if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW)
+            throw runtime_error(action + ": " + (db ? sqlite3_errmsg(db) : "SQLite error"));
+    }
+    void execute(const string& sql) const {
+        char* error=nullptr;
+        int rc=sqlite3_exec(db,sql.c_str(),nullptr,nullptr,&error);
+        if(rc!=SQLITE_OK){string message=error?error:sqlite3_errmsg(db);sqlite3_free(error);throw runtime_error("Database error: "+message);}
+    }
+    sqlite3_stmt* prepare(const string& sql) const {
+        sqlite3_stmt* stmt=nullptr;
+        checkSql(sqlite3_prepare_v2(db,sql.c_str(),-1,&stmt,nullptr),"Prepare statement");
+        return stmt;
+    }
+    static string columnText(sqlite3_stmt* stmt,int column) {
+        const unsigned char* value=sqlite3_column_text(stmt,column);
+        return value?reinterpret_cast<const char*>(value):"";
+    }
 public:
-    InventoryManager() { seed(); load(); }
+    InventoryManager() {
+        const char* configured=getenv("DATABASE_PATH");
+        dbPath=(configured&&*configured)?configured:"data/market.db";
+        filesystem::path p(dbPath);
+        if(p.has_parent_path()) filesystem::create_directories(p.parent_path());
+        checkSql(sqlite3_open(dbPath.c_str(),&db),"Open database");
+        execute("PRAGMA journal_mode=WAL;");
+        execute("PRAGMA foreign_keys=ON;");
+        execute("CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, produce TEXT NOT NULL, received REAL NOT NULL, arrival TEXT NOT NULL, expiry TEXT NOT NULL, remaining REAL NOT NULL, reorder_level REAL NOT NULL);");
+        execute("CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, retailer_id TEXT NOT NULL, channel TEXT NOT NULL, produce TEXT NOT NULL, quantity REAL NOT NULL, unit_price REAL NOT NULL, batch_used TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL);");
+        execute("CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, order_id TEXT NOT NULL, driver_id TEXT NOT NULL, scheduled_date TEXT NOT NULL, status TEXT NOT NULL);");
+        seed();
+        load();
+        save();
+    }
+    ~InventoryManager() { if(db) sqlite3_close(db); }
     void seed() {
         prices={{"Tomatoes",90},{"Cabbages",65},{"Hass Avocados",180},{"Red Onions",120}};
         reorderLevels={{"Tomatoes",80},{"Cabbages",50},{"Hass Avocados",35},{"Red Onions",60}};
@@ -256,30 +294,94 @@ public:
         int todayOrders=0; double revenue=0; for(auto& o:orders)if(o.getCreatedAt().substr(0,10)==today()){todayOrders++;revenue+=o.getTotal();}
         return "{\"todayOrders\":"+to_string(todayOrders)+",\"dailyRevenue\":"+to_string((int)revenue)+",\"lowStockCount\":"+to_string(low)+",\"expiringBatches\":"+to_string(exp)+"}";
     }
-    // Load the last saved snapshot. Retailers and drivers remain seeded reference data.
+    // Restore the complete persisted state from SQLite. Seed data is used only for an empty database.
     void load() {
-        ifstream f("data/market.csv"); if(!f) return;
-        string line; getline(f,line); vector<ProduceBatch> loadedBatches; vector<Order> loadedOrders; vector<Delivery> loadedDeliveries;
-        while(getline(f,line)) {
-            stringstream ss(line); vector<string> c; string part; while(getline(ss,part,',')) c.push_back(part);
-            try {
-                if(c.size()>=8 && c[0]=="BATCH") { ProduceBatch b(c[1],c[2],stod(c[3]),c[4],c[5],stod(c[7])); b.setRemaining(stod(c[6])); loadedBatches.push_back(b); }
-                else if(c.size()>=9 && c[0]=="ORDER") { Order o(c[1],c[2],c[3],c[4],stod(c[5]),stod(c[6]),c[7]); if(c[8]!="Confirmed")o.setStatus(c[8]); loadedOrders.push_back(o); }
-                else if(c.size()>=6 && c[0]=="DELIVERY") loadedDeliveries.emplace_back(c[1],c[2],c[3],c[4]);
-            } catch(...) { /* Ignore a malformed demo row and keep the remaining records. */ }
+        vector<ProduceBatch> loadedBatches;
+        vector<Order> loadedOrders;
+        vector<Delivery> loadedDeliveries;
+        sqlite3_stmt* stmt=prepare("SELECT id,produce,received,arrival,expiry,remaining,reorder_level FROM batches ORDER BY rowid");
+        while(sqlite3_step(stmt)==SQLITE_ROW) {
+            ProduceBatch b(columnText(stmt,0),columnText(stmt,1),sqlite3_column_double(stmt,2),columnText(stmt,3),columnText(stmt,4),sqlite3_column_double(stmt,6));
+            b.setRemaining(sqlite3_column_double(stmt,5));
+            loadedBatches.push_back(move(b));
         }
+        sqlite3_finalize(stmt);
+        stmt=prepare("SELECT id,retailer_id,channel,produce,quantity,unit_price,batch_used,created_at,status FROM orders ORDER BY rowid");
+        while(sqlite3_step(stmt)==SQLITE_ROW) {
+            Order o(columnText(stmt,0),columnText(stmt,1),columnText(stmt,2),columnText(stmt,3),sqlite3_column_double(stmt,4),sqlite3_column_double(stmt,5),columnText(stmt,6));
+            o.setCreatedAt(columnText(stmt,7));
+            o.setStatus(columnText(stmt,8));
+            loadedOrders.push_back(move(o));
+        }
+        sqlite3_finalize(stmt);
+        stmt=prepare("SELECT id,order_id,driver_id,scheduled_date FROM deliveries ORDER BY rowid");
+        while(sqlite3_step(stmt)==SQLITE_ROW)
+            loadedDeliveries.emplace_back(columnText(stmt,0),columnText(stmt,1),columnText(stmt,2),columnText(stmt,3));
+        sqlite3_finalize(stmt);
         if(!loadedBatches.empty()) batches=move(loadedBatches);
         if(!loadedOrders.empty()) orders=move(loadedOrders);
         if(!loadedDeliveries.empty()) deliveries=move(loadedDeliveries);
-        nextBatch=static_cast<int>(batches.size())+1; nextOrder=static_cast<int>(orders.size())+1; nextDelivery=static_cast<int>(deliveries.size())+1;
+        auto nextNumber=[](const auto& items,const string& prefix) {
+            int highest=0;
+            for(const auto& item:items) {
+                string id=item.getId();
+                if(id.rfind(prefix,0)==0) try { highest=max(highest,stoi(id.substr(prefix.size()))); } catch(...) {}
+            }
+            return highest+1;
+        };
+        nextBatch=nextNumber(batches,"B");
+        nextOrder=nextNumber(orders,"O");
+        nextDelivery=nextNumber(deliveries,"DEL");
     }
-    // CSV snapshot persistence keeps the prototype dependency-free and survives restarts.
+    // Replace the snapshot atomically so a failed write never leaves half-saved market data.
     void save() const {
-        ofstream f("data/market.csv"); if(!f)return;
-        f<<"TYPE,id,ref,quantity,field1,field2,field3,field4,field5\n";
-        for(auto& b:batches)f<<"BATCH,"<<b.getId()<<","<<b.getProduce()<<","<<b.getReceived()<<","<<b.getArrivalDate()<<","<<b.getExpiryDate()<<","<<b.getRemaining()<<","<<b.getReorderLevel()<<",-\n";
-        for(auto& o:orders)f<<"ORDER,"<<o.getId()<<","<<o.getRetailerId()<<","<<o.getQuantity()<<","<<o.getChannel()<<","<<o.getProduce()<<","<<o.getUnitPrice()<<","<<o.getBatchUsed()<<","<<o.getStatus()<<"\n";
-        for(auto& d:deliveries)f<<"DELIVERY,"<<d.getId()<<","<<d.getOrderId()<<","<<d.getDriverId()<<","<<d.getScheduledDate()<<",-\n";
+        execute("BEGIN IMMEDIATE TRANSACTION;");
+        try {
+            execute("DELETE FROM batches; DELETE FROM orders; DELETE FROM deliveries;");
+            sqlite3_stmt* stmt=prepare("INSERT INTO batches(id,produce,received,arrival,expiry,remaining,reorder_level) VALUES(?,?,?,?,?,?,?)");
+            for(const auto& b:batches) {
+                sqlite3_bind_text(stmt,1,b.getId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,2,b.getProduce().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_double(stmt,3,b.getReceived());
+                sqlite3_bind_text(stmt,4,b.getArrivalDate().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,5,b.getExpiryDate().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_double(stmt,6,b.getRemaining());
+                sqlite3_bind_double(stmt,7,b.getReorderLevel());
+                checkSql(sqlite3_step(stmt),"Save batch");
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+            }
+            sqlite3_finalize(stmt);
+            stmt=prepare("INSERT INTO orders(id,retailer_id,channel,produce,quantity,unit_price,batch_used,created_at,status) VALUES(?,?,?,?,?,?,?,?,?)");
+            for(const auto& o:orders) {
+                sqlite3_bind_text(stmt,1,o.getId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,2,o.getRetailerId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,3,o.getChannel().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,4,o.getProduce().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_double(stmt,5,o.getQuantity());
+                sqlite3_bind_double(stmt,6,o.getUnitPrice());
+                sqlite3_bind_text(stmt,7,o.getBatchUsed().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,8,o.getCreatedAt().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,9,o.getStatus().c_str(),-1,SQLITE_TRANSIENT);
+                checkSql(sqlite3_step(stmt),"Save order");
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+            }
+            sqlite3_finalize(stmt);
+            stmt=prepare("INSERT INTO deliveries(id,order_id,driver_id,scheduled_date,status) VALUES(?,?,?,?,?)");
+            for(const auto& d:deliveries) {
+                sqlite3_bind_text(stmt,1,d.getId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,2,d.getOrderId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,3,d.getDriverId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,4,d.getScheduledDate().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,5,d.getStatus().c_str(),-1,SQLITE_TRANSIENT);
+                checkSql(sqlite3_step(stmt),"Save delivery");
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+            }
+            sqlite3_finalize(stmt);
+            execute("COMMIT;");
+        } catch(...) {
+            execute("ROLLBACK;");
+            throw;
+        }
     }
 };
 
@@ -297,6 +399,7 @@ void handleClient(int client, InventoryManager& market) {
     string head=req.substr(0,split),body=req.substr(split+4); istringstream hs(head);string method,path,version;hs>>method>>path>>version;
     try {
         if(method=="OPTIONS"){sendResponse(client,200,"text/plain","ok");return;}
+        if(method=="GET" && path=="/healthz"){sendResponse(client,200,"application/json","{\"status\":\"ok\"}");return;}
         if(method=="GET" && (path=="/"||path=="/index.html")){string html=readFile("index.html");if(html.empty())html="<h1>Missing index.html</h1>";sendResponse(client,200,"text/html; charset=utf-8",html);return;}
         if(method=="GET") {
             if(path=="/api/dashboard")sendResponse(client,200,"application/json",market.dashboardJson());
@@ -323,13 +426,14 @@ void handleClient(int client, InventoryManager& market) {
     } catch(const exception& e){sendResponse(client,400,"application/json","{\"error\":"+jsonString(e.what())+"}");}
 }
 int main() {
-    mkdir("data",0755);
+    try {
     InventoryManager market;
     int server=socket(AF_INET,SOCK_STREAM,0); if(server<0){cerr<<"Could not create server socket\n";return 1;}
     int yes=1;setsockopt(server,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
     sockaddr_in addr{};addr.sin_family=AF_INET;addr.sin_addr.s_addr=INADDR_ANY;int port=8080; if(const char* envPort=getenv("PORT")) port=stoi(envPort); addr.sin_port=htons(port);
-    if(bind(server,(sockaddr*)&addr,sizeof(addr))<0||listen(server,20)<0){cerr<<"Could not bind port 8080. Is it already in use?\n";close(server);return 1;}
+    if(bind(server,(sockaddr*)&addr,sizeof(addr))<0||listen(server,20)<0){cerr<<"Could not bind port "<<port<<". Is it already in use?\n";close(server);return 1;}
     cout<<"Nakuru Fresh Produce Market listening on port "<<port<<"\nPress Ctrl+C to stop.\n";
     while(true){int client=accept(server,nullptr,nullptr);if(client>=0){handleClient(client,market);close(client);}}
     close(server);return 0;
+    } catch(const exception& e) { cerr<<"Startup failed: "<<e.what()<<"\n"; return 1; }
 }
