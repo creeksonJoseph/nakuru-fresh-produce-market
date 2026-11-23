@@ -4,12 +4,15 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <ctime>
+#include <condition_variable>
+#include <deque>
 #include <postgresql/libpq-fe.h>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <netinet/in.h>
 #include <regex>
 #include <sstream>
@@ -18,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <thread>
 #include <vector>
 
 using namespace std;
@@ -354,7 +358,7 @@ void sendResponse(int client,int status,const string& type,const string& body,co
     ostringstream o;o<<"HTTP/1.1 "<<status<<" "<<reason<<"\r\nContent-Type: "<<type<<"\r\nContent-Length: "<<body.size()<<"\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n"<<extra<<"\r\n"<<body;
     string out=o.str();send(client,out.c_str(),out.size(),0);
 }
-void handleClient(int client, InventoryManager& market) {
+void handleClient(int client, InventoryManager& market, mutex& marketMutex) {
     string req; char buf[8192]; ssize_t n;
     while((n=recv(client,buf,sizeof(buf),0))>0){req.append(buf,n); if(req.find("\r\n\r\n")!=string::npos){size_t h=req.find("\r\n\r\n");smatch m;regex cr("Content-Length: ([0-9]+)",regex::icase);size_t len=regex_search(req,m,cr)?stoul(m[1].str()):0;if(req.size()>=h+4+len)break;}}
     size_t split=req.find("\r\n\r\n"); if(split==string::npos){sendResponse(client,400,"application/json","{\"error\":\"Bad request\"}");return;}
@@ -364,6 +368,8 @@ void handleClient(int client, InventoryManager& market) {
         if(method=="GET" && path=="/healthz"){sendResponse(client,200,"application/json","{\"status\":\"ok\"}");return;}
         if(method=="GET" && (path=="/"||path=="/index.html")){string html=readFile("index.html");if(html.empty())html="<h1>Missing index.html</h1>";sendResponse(client,200,"text/html; charset=utf-8",html);return;}
         if(method=="GET") {
+            // InventoryManager and its single libpq connection are shared by all workers.
+            lock_guard<mutex> marketLock(marketMutex);
             if(path=="/api/dashboard")sendResponse(client,200,"application/json",market.dashboardJson());
             else if(path=="/api/inventory")sendResponse(client,200,"application/json",market.inventoryJson());
             else if(path=="/api/products")sendResponse(client,200,"application/json",market.productsJson());
@@ -377,6 +383,8 @@ void handleClient(int client, InventoryManager& market) {
             return;
         }
         if(method=="POST") {
+            // Keep each business operation and its PostgreSQL snapshot save atomic within this process.
+            lock_guard<mutex> marketLock(marketMutex);
             string id;
             if(path=="/api/orders") id=market.createOrder(field(body,"retailerId"),field(body,"channel"),field(body,"produce"),numberField(body,"quantity"));
             else if(path=="/api/batches") id=market.intake(field(body,"produce"),numberField(body,"quantity"),field(body,"arrivalDate"),field(body,"expiryDate"));
@@ -395,7 +403,41 @@ int main() {
     sockaddr_in addr{};addr.sin_family=AF_INET;addr.sin_addr.s_addr=INADDR_ANY;int port=8080; if(const char* envPort=getenv("PORT")) port=stoi(envPort); addr.sin_port=htons(port);
     if(bind(server,(sockaddr*)&addr,sizeof(addr))<0||listen(server,20)<0){cerr<<"Could not bind port "<<port<<". Is it already in use?\n";close(server);return 1;}
     cout<<"Nakuru Fresh Produce Market listening on port "<<port<<"\nPress Ctrl+C to stop.\n";
-    while(true){int client=accept(server,nullptr,nullptr);if(client>=0){handleClient(client,market);close(client);}}
+    // A fixed worker pool lets several browser sessions connect at the same time.
+    // Market operations are protected by one mutex because the prototype shares
+    // in-memory collections and one PostgreSQL connection between all workers.
+    constexpr size_t WORKER_COUNT = 4;
+    deque<int> pendingClients;
+    mutex queueMutex;
+    mutex marketMutex;
+    condition_variable queueReady;
+    vector<thread> workers;
+    workers.reserve(WORKER_COUNT);
+    for(size_t i=0;i<WORKER_COUNT;++i) {
+        workers.emplace_back([&]() {
+            while(true) {
+                int client;
+                {
+                    unique_lock<mutex> lock(queueMutex);
+                    queueReady.wait(lock,[&]() { return !pendingClients.empty(); });
+                    client=pendingClients.front();
+                    pendingClients.pop_front();
+                }
+                try { handleClient(client,market,marketMutex); }
+                catch(const exception& e) { cerr<<"Request handling failed: "<<e.what()<<"\\n"; }
+                close(client);
+            }
+        });
+    }
+    while(true) {
+        int client=accept(server,nullptr,nullptr);
+        if(client<0) continue;
+        {
+            lock_guard<mutex> lock(queueMutex);
+            pendingClients.push_back(client);
+        }
+        queueReady.notify_one();
+    }
     close(server);return 0;
     } catch(const exception& e) { cerr<<"Startup failed: "<<e.what()<<"\n"; return 1; }
 }
