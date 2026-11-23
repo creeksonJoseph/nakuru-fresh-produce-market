@@ -2,7 +2,4 @@
 .gitignore
 README.md
 market_app
-*.db
-*.db-shm
-*.db-wal
-data/
+.env
