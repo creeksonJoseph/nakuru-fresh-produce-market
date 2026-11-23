@@ -6,6 +6,7 @@
 #include <ctime>
 #include <filesystem>
 #include <sqlite3.h>
+#include <libpq-fe.h>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -164,6 +165,8 @@ class InventoryManager {
     map<string,double> reorderLevels;
     int nextOrder=4, nextBatch=6, nextDelivery=3;
     sqlite3* db=nullptr;
+    PGconn* pg=nullptr;
+    bool usePostgres=false;
     string dbPath;
     void checkSql(int rc, const string& action) const {
         if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW)
@@ -179,27 +182,53 @@ class InventoryManager {
         checkSql(sqlite3_prepare_v2(db,sql.c_str(),-1,&stmt,nullptr),"Prepare statement");
         return stmt;
     }
+    void pgExecute(const string& sql) const {
+        PGresult* result=PQexec(pg,sql.c_str());
+        if(!result || (PQresultStatus(result)!=PGRES_COMMAND_OK && PQresultStatus(result)!=PGRES_TUPLES_OK)) {
+            string message=result?PQresultErrorMessage(result):PQerrorMessage(pg);
+            if(result) PQclear(result);
+            throw runtime_error("PostgreSQL error: "+message);
+        }
+        PQclear(result);
+    }
+    static string pgLiteral(PGconn* connection,const string& value) {
+        char* escaped=PQescapeLiteral(connection,value.c_str(),value.size());
+        if(!escaped) throw runtime_error("Could not escape PostgreSQL value");
+        string result=escaped; PQfreemem(escaped); return result;
+    }
+    static string pgNumber(double value) { ostringstream out; out<<setprecision(15)<<value; return out.str(); }
     static string columnText(sqlite3_stmt* stmt,int column) {
         const unsigned char* value=sqlite3_column_text(stmt,column);
         return value?reinterpret_cast<const char*>(value):"";
     }
 public:
     InventoryManager() {
-        const char* configured=getenv("DATABASE_PATH");
-        dbPath=(configured&&*configured)?configured:"data/market.db";
-        filesystem::path p(dbPath);
-        if(p.has_parent_path()) filesystem::create_directories(p.parent_path());
-        checkSql(sqlite3_open(dbPath.c_str(),&db),"Open database");
-        execute("PRAGMA journal_mode=WAL;");
-        execute("PRAGMA foreign_keys=ON;");
-        execute("CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, produce TEXT NOT NULL, received REAL NOT NULL, arrival TEXT NOT NULL, expiry TEXT NOT NULL, remaining REAL NOT NULL, reorder_level REAL NOT NULL);");
-        execute("CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, retailer_id TEXT NOT NULL, channel TEXT NOT NULL, produce TEXT NOT NULL, quantity REAL NOT NULL, unit_price REAL NOT NULL, batch_used TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL);");
-        execute("CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, order_id TEXT NOT NULL, driver_id TEXT NOT NULL, scheduled_date TEXT NOT NULL, status TEXT NOT NULL);");
+        const char* databaseUrl=getenv("DATABASE_URL");
+        usePostgres=(databaseUrl && *databaseUrl);
+        if(usePostgres) {
+            pg=PQconnectdb(databaseUrl);
+            if(!pg || PQstatus(pg)!=CONNECTION_OK)
+                throw runtime_error(string("Could not connect to PostgreSQL: ")+(pg?PQerrorMessage(pg):"connection allocation failed"));
+            pgExecute("CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, produce TEXT NOT NULL, received DOUBLE PRECISION NOT NULL, arrival TEXT NOT NULL, expiry TEXT NOT NULL, remaining DOUBLE PRECISION NOT NULL, reorder_level DOUBLE PRECISION NOT NULL)");
+            pgExecute("CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, retailer_id TEXT NOT NULL, channel TEXT NOT NULL, produce TEXT NOT NULL, quantity DOUBLE PRECISION NOT NULL, unit_price DOUBLE PRECISION NOT NULL, batch_used TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL)");
+            pgExecute("CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, order_id TEXT NOT NULL, driver_id TEXT NOT NULL, scheduled_date TEXT NOT NULL, status TEXT NOT NULL)");
+        } else {
+            const char* configured=getenv("DATABASE_PATH");
+            dbPath=(configured&&*configured)?configured:"data/market.db";
+            filesystem::path p(dbPath);
+            if(p.has_parent_path()) filesystem::create_directories(p.parent_path());
+            checkSql(sqlite3_open(dbPath.c_str(),&db),"Open database");
+            execute("PRAGMA journal_mode=WAL;");
+            execute("PRAGMA foreign_keys=ON;");
+            execute("CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, produce TEXT NOT NULL, received REAL NOT NULL, arrival TEXT NOT NULL, expiry TEXT NOT NULL, remaining REAL NOT NULL, reorder_level REAL NOT NULL);");
+            execute("CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, retailer_id TEXT NOT NULL, channel TEXT NOT NULL, produce TEXT NOT NULL, quantity REAL NOT NULL, unit_price REAL NOT NULL, batch_used TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL);");
+            execute("CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, order_id TEXT NOT NULL, driver_id TEXT NOT NULL, scheduled_date TEXT NOT NULL, status TEXT NOT NULL);");
+        }
         seed();
         load();
         save();
     }
-    ~InventoryManager() { if(db) sqlite3_close(db); }
+    ~InventoryManager() { if(db) sqlite3_close(db); if(pg) PQfinish(pg); }
     void seed() {
         prices={{"Tomatoes",90},{"Cabbages",65},{"Hass Avocados",180},{"Red Onions",120}};
         reorderLevels={{"Tomatoes",80},{"Cabbages",50},{"Hass Avocados",35},{"Red Onions",60}};
@@ -295,94 +324,108 @@ public:
         int todayOrders=0; double revenue=0; for(auto& o:orders)if(o.getCreatedAt().substr(0,10)==today()){todayOrders++;revenue+=o.getTotal();}
         return "{\"todayOrders\":"+to_string(todayOrders)+",\"dailyRevenue\":"+to_string((int)revenue)+",\"lowStockCount\":"+to_string(low)+",\"expiringBatches\":"+to_string(exp)+"}";
     }
-    // Restore the complete persisted state from SQLite. Seed data is used only for an empty database.
+    // Load persisted market data from PostgreSQL when DATABASE_URL is set, otherwise SQLite.
     void load() {
         vector<ProduceBatch> loadedBatches;
         vector<Order> loadedOrders;
         vector<Delivery> loadedDeliveries;
-        sqlite3_stmt* stmt=prepare("SELECT id,produce,received,arrival,expiry,remaining,reorder_level FROM batches ORDER BY rowid");
-        while(sqlite3_step(stmt)==SQLITE_ROW) {
-            ProduceBatch b(columnText(stmt,0),columnText(stmt,1),sqlite3_column_double(stmt,2),columnText(stmt,3),columnText(stmt,4),sqlite3_column_double(stmt,6));
-            b.setRemaining(sqlite3_column_double(stmt,5));
-            loadedBatches.push_back(move(b));
+        if(usePostgres) {
+            PGresult* result=PQexec(pg,"SELECT id,produce,received,arrival,expiry,remaining,reorder_level FROM batches ORDER BY id");
+            if(!result || PQresultStatus(result)!=PGRES_TUPLES_OK) { string e=result?PQresultErrorMessage(result):PQerrorMessage(pg); if(result)PQclear(result); throw runtime_error(e); }
+            for(int i=0;i<PQntuples(result);++i) {
+                ProduceBatch b(PQgetvalue(result,i,0),PQgetvalue(result,i,1),stod(PQgetvalue(result,i,2)),PQgetvalue(result,i,3),PQgetvalue(result,i,4),stod(PQgetvalue(result,i,6)));
+                b.setRemaining(stod(PQgetvalue(result,i,5))); loadedBatches.push_back(move(b));
+            }
+            PQclear(result);
+            result=PQexec(pg,"SELECT id,retailer_id,channel,produce,quantity,unit_price,batch_used,created_at,status FROM orders ORDER BY id");
+            if(!result || PQresultStatus(result)!=PGRES_TUPLES_OK) { string e=result?PQresultErrorMessage(result):PQerrorMessage(pg); if(result)PQclear(result); throw runtime_error(e); }
+            for(int i=0;i<PQntuples(result);++i) {
+                Order o(PQgetvalue(result,i,0),PQgetvalue(result,i,1),PQgetvalue(result,i,2),PQgetvalue(result,i,3),stod(PQgetvalue(result,i,4)),stod(PQgetvalue(result,i,5)),PQgetvalue(result,i,6));
+                o.setCreatedAt(PQgetvalue(result,i,7)); o.setStatus(PQgetvalue(result,i,8)); loadedOrders.push_back(move(o));
+            }
+            PQclear(result);
+            result=PQexec(pg,"SELECT id,order_id,driver_id,scheduled_date FROM deliveries ORDER BY id");
+            if(!result || PQresultStatus(result)!=PGRES_TUPLES_OK) { string e=result?PQresultErrorMessage(result):PQerrorMessage(pg); if(result)PQclear(result); throw runtime_error(e); }
+            for(int i=0;i<PQntuples(result);++i) loadedDeliveries.emplace_back(PQgetvalue(result,i,0),PQgetvalue(result,i,1),PQgetvalue(result,i,2),PQgetvalue(result,i,3));
+            PQclear(result);
+        } else {
+            sqlite3_stmt* stmt=prepare("SELECT id,produce,received,arrival,expiry,remaining,reorder_level FROM batches ORDER BY rowid");
+            while(sqlite3_step(stmt)==SQLITE_ROW) {
+                ProduceBatch b(columnText(stmt,0),columnText(stmt,1),sqlite3_column_double(stmt,2),columnText(stmt,3),columnText(stmt,4),sqlite3_column_double(stmt,6));
+                b.setRemaining(sqlite3_column_double(stmt,5)); loadedBatches.push_back(move(b));
+            }
+            sqlite3_finalize(stmt);
+            stmt=prepare("SELECT id,retailer_id,channel,produce,quantity,unit_price,batch_used,created_at,status FROM orders ORDER BY rowid");
+            while(sqlite3_step(stmt)==SQLITE_ROW) {
+                Order o(columnText(stmt,0),columnText(stmt,1),columnText(stmt,2),columnText(stmt,3),sqlite3_column_double(stmt,4),sqlite3_column_double(stmt,5),columnText(stmt,6));
+                o.setCreatedAt(columnText(stmt,7)); o.setStatus(columnText(stmt,8)); loadedOrders.push_back(move(o));
+            }
+            sqlite3_finalize(stmt);
+            stmt=prepare("SELECT id,order_id,driver_id,scheduled_date FROM deliveries ORDER BY rowid");
+            while(sqlite3_step(stmt)==SQLITE_ROW) loadedDeliveries.emplace_back(columnText(stmt,0),columnText(stmt,1),columnText(stmt,2),columnText(stmt,3));
+            sqlite3_finalize(stmt);
         }
-        sqlite3_finalize(stmt);
-        stmt=prepare("SELECT id,retailer_id,channel,produce,quantity,unit_price,batch_used,created_at,status FROM orders ORDER BY rowid");
-        while(sqlite3_step(stmt)==SQLITE_ROW) {
-            Order o(columnText(stmt,0),columnText(stmt,1),columnText(stmt,2),columnText(stmt,3),sqlite3_column_double(stmt,4),sqlite3_column_double(stmt,5),columnText(stmt,6));
-            o.setCreatedAt(columnText(stmt,7));
-            o.setStatus(columnText(stmt,8));
-            loadedOrders.push_back(move(o));
-        }
-        sqlite3_finalize(stmt);
-        stmt=prepare("SELECT id,order_id,driver_id,scheduled_date FROM deliveries ORDER BY rowid");
-        while(sqlite3_step(stmt)==SQLITE_ROW)
-            loadedDeliveries.emplace_back(columnText(stmt,0),columnText(stmt,1),columnText(stmt,2),columnText(stmt,3));
-        sqlite3_finalize(stmt);
         if(!loadedBatches.empty()) batches=move(loadedBatches);
         if(!loadedOrders.empty()) orders=move(loadedOrders);
         if(!loadedDeliveries.empty()) deliveries=move(loadedDeliveries);
         auto nextNumber=[](const auto& items,const string& prefix) {
             int highest=0;
-            for(const auto& item:items) {
-                string id=item.getId();
-                if(id.rfind(prefix,0)==0) try { highest=max(highest,stoi(id.substr(prefix.size()))); } catch(...) {}
-            }
+            for(const auto& item:items) { string id=item.getId(); if(id.rfind(prefix,0)==0) try { highest=max(highest,stoi(id.substr(prefix.size()))); } catch(...) {} }
             return highest+1;
         };
-        nextBatch=nextNumber(batches,"B");
-        nextOrder=nextNumber(orders,"O");
-        nextDelivery=nextNumber(deliveries,"DEL");
+        nextBatch=nextNumber(batches,"B"); nextOrder=nextNumber(orders,"O"); nextDelivery=nextNumber(deliveries,"DEL");
     }
-    // Replace the snapshot atomically so a failed write never leaves half-saved market data.
+    // Save all collections as one transaction in the selected database.
     void save() const {
+        if(usePostgres) {
+            pgExecute("BEGIN");
+            try {
+                pgExecute("DELETE FROM batches"); pgExecute("DELETE FROM orders"); pgExecute("DELETE FROM deliveries");
+                for(const auto& b:batches) {
+                    string sql="INSERT INTO batches VALUES("+pgLiteral(pg,b.getId())+","+pgLiteral(pg,b.getProduce())+","+pgNumber(b.getReceived())+","+pgLiteral(pg,b.getArrivalDate())+","+pgLiteral(pg,b.getExpiryDate())+","+pgNumber(b.getRemaining())+","+pgNumber(b.getReorderLevel())+")";
+                    pgExecute(sql);
+                }
+                for(const auto& o:orders) {
+                    string sql="INSERT INTO orders VALUES("+pgLiteral(pg,o.getId())+","+pgLiteral(pg,o.getRetailerId())+","+pgLiteral(pg,o.getChannel())+","+pgLiteral(pg,o.getProduce())+","+pgNumber(o.getQuantity())+","+pgNumber(o.getUnitPrice())+","+pgLiteral(pg,o.getBatchUsed())+","+pgLiteral(pg,o.getCreatedAt())+","+pgLiteral(pg,o.getStatus())+")";
+                    pgExecute(sql);
+                }
+                for(const auto& d:deliveries) {
+                    string sql="INSERT INTO deliveries VALUES("+pgLiteral(pg,d.getId())+","+pgLiteral(pg,d.getOrderId())+","+pgLiteral(pg,d.getDriverId())+","+pgLiteral(pg,d.getScheduledDate())+","+pgLiteral(pg,d.getStatus())+")";
+                    pgExecute(sql);
+                }
+                pgExecute("COMMIT");
+            } catch(...) { try { pgExecute("ROLLBACK"); } catch(...) {} throw; }
+            return;
+        }
         execute("BEGIN IMMEDIATE TRANSACTION;");
         try {
             execute("DELETE FROM batches; DELETE FROM orders; DELETE FROM deliveries;");
             sqlite3_stmt* stmt=prepare("INSERT INTO batches(id,produce,received,arrival,expiry,remaining,reorder_level) VALUES(?,?,?,?,?,?,?)");
             for(const auto& b:batches) {
-                sqlite3_bind_text(stmt,1,b.getId().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,2,b.getProduce().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_double(stmt,3,b.getReceived());
-                sqlite3_bind_text(stmt,4,b.getArrivalDate().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,5,b.getExpiryDate().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_double(stmt,6,b.getRemaining());
-                sqlite3_bind_double(stmt,7,b.getReorderLevel());
-                checkSql(sqlite3_step(stmt),"Save batch");
-                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+                sqlite3_bind_text(stmt,1,b.getId().c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(stmt,2,b.getProduce().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_double(stmt,3,b.getReceived()); sqlite3_bind_text(stmt,4,b.getArrivalDate().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,5,b.getExpiryDate().c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_double(stmt,6,b.getRemaining()); sqlite3_bind_double(stmt,7,b.getReorderLevel());
+                checkSql(sqlite3_step(stmt),"Save batch"); sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
             }
             sqlite3_finalize(stmt);
             stmt=prepare("INSERT INTO orders(id,retailer_id,channel,produce,quantity,unit_price,batch_used,created_at,status) VALUES(?,?,?,?,?,?,?,?,?)");
             for(const auto& o:orders) {
-                sqlite3_bind_text(stmt,1,o.getId().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,2,o.getRetailerId().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,3,o.getChannel().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,4,o.getProduce().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_double(stmt,5,o.getQuantity());
-                sqlite3_bind_double(stmt,6,o.getUnitPrice());
-                sqlite3_bind_text(stmt,7,o.getBatchUsed().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,8,o.getCreatedAt().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,9,o.getStatus().c_str(),-1,SQLITE_TRANSIENT);
-                checkSql(sqlite3_step(stmt),"Save order");
-                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+                sqlite3_bind_text(stmt,1,o.getId().c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(stmt,2,o.getRetailerId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,3,o.getChannel().c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(stmt,4,o.getProduce().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_double(stmt,5,o.getQuantity()); sqlite3_bind_double(stmt,6,o.getUnitPrice()); sqlite3_bind_text(stmt,7,o.getBatchUsed().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,8,o.getCreatedAt().c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(stmt,9,o.getStatus().c_str(),-1,SQLITE_TRANSIENT);
+                checkSql(sqlite3_step(stmt),"Save order"); sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
             }
             sqlite3_finalize(stmt);
             stmt=prepare("INSERT INTO deliveries(id,order_id,driver_id,scheduled_date,status) VALUES(?,?,?,?,?)");
             for(const auto& d:deliveries) {
-                sqlite3_bind_text(stmt,1,d.getId().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,2,d.getOrderId().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,3,d.getDriverId().c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt,4,d.getScheduledDate().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,1,d.getId().c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(stmt,2,d.getOrderId().c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt,3,d.getDriverId().c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(stmt,4,d.getScheduledDate().c_str(),-1,SQLITE_TRANSIENT);
                 sqlite3_bind_text(stmt,5,d.getStatus().c_str(),-1,SQLITE_TRANSIENT);
-                checkSql(sqlite3_step(stmt),"Save delivery");
-                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+                checkSql(sqlite3_step(stmt),"Save delivery"); sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
             }
-            sqlite3_finalize(stmt);
-            execute("COMMIT;");
-        } catch(...) {
-            execute("ROLLBACK;");
-            throw;
-        }
+            sqlite3_finalize(stmt); execute("COMMIT;");
+        } catch(...) { execute("ROLLBACK;"); throw; }
     }
 };
 
