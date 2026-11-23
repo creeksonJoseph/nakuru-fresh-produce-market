@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
