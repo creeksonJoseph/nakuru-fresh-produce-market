@@ -424,7 +424,7 @@ int main() {
                     pendingClients.pop_front();
                 }
                 try { handleClient(client,market,marketMutex); }
-                catch(const exception& e) { cerr<<"Request handling failed: "<<e.what()<<"\\n"; }
+                catch(const exception& e) { cerr<<"Request handling failed: "<<e.what()<<"\n"; }
                 close(client);
             }
         });
