@@ -6,7 +6,7 @@
 #include <ctime>
 #include <filesystem>
 #include <sqlite3.h>
-#include <libpq-fe.h>
+#include <postgresql/libpq-fe.h>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
