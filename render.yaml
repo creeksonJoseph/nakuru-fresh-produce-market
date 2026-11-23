@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: nakuru-fresh-produce-market
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_PATH
+        value: /tmp/nakuru-market.db
