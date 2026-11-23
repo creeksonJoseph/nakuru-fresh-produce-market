@@ -44,7 +44,7 @@ set +a
 ## Build and run locally
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra main.cpp -lpq -o market_app
+g++ -std=c++17 -O2 -Wall -Wextra main.cpp -pthread -lpq -o market_app
 ./market_app
 ```
 
@@ -94,6 +94,8 @@ The web service listens on Render's assigned `PORT` and exposes `/healthz` as it
 - Spoilage / low-stock alerts
 - Daily sales summary
 - PostgreSQL persistence for both local development and production
+- Four-worker HTTP request pool so several teammates can use the app at the same time
+- Shared inventory and PostgreSQL operations are safely coordinated within the running app process
 - `GET /healthz` health-check endpoint
 
 ## API routes
@@ -125,4 +127,4 @@ The web service listens on Render's assigned `PORT` and exposes `/healthz` as it
 
 ## Prototype limitations
 
-This is an academic demonstration, not a production-ready commerce system. Authentication and authorization, a production-grade HTTP framework, robust JSON parsing, database migrations, automated backups and multi-instance concurrency controls are not implemented.
+This is an academic demonstration, not a production-ready commerce system. There is no authentication, so anyone with the URL can access the demo. The server uses four request workers, while shared inventory and database operations are serialized with a mutex to protect the in-memory state and the single PostgreSQL connection. This supports several teammates using one running app instance, but it is not designed for multiple app instances or production-scale concurrent writes. A production deployment would also need a production-grade HTTP framework, robust JSON parsing, database migrations and automated backups.
