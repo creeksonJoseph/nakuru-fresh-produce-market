@@ -1,48 +1,56 @@
 # Nakuru Fresh Produce Market
 
-A small C++17 + HTML/CSS/vanilla JavaScript prototype for managing produce inventory, retailer orders, dispatches, alerts and daily sales.
+A small C++17 + HTML/CSS/vanilla JavaScript prototype for managing produce inventory, retailer orders, dispatches, alerts and daily sales. PostgreSQL is the only database used by the application.
 
 ## Requirements
 
 - Ubuntu/Linux
 - g++ with C++17 support
-- SQLite development library
-- PostgreSQL client development library (only needed when building with PostgreSQL support)
+- PostgreSQL client development library
 
 Install dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y g++ libsqlite3-dev libpq-dev
+sudo apt install -y g++ libpq-dev
 ```
 
-## Run locally (SQLite)
+## Configure local development
+
+The application requires a PostgreSQL connection string in the `DATABASE_URL` environment variable. Use the **External Database URL** from your Render PostgreSQL dashboard when connecting from your local computer.
+
+In the project directory, run:
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra main.cpp -lsqlite3 -lpq -o market_app
+export DATABASE_URL='YOUR_RENDER_EXTERNAL_DATABASE_URL'
+```
+
+Keep the URL private. Never paste it into source code, commit it to GitHub, or put it in the Dockerfile.
+
+To avoid exporting it every time, create a local `.env` file (already excluded from Git) containing:
+
+```env
+DATABASE_URL=YOUR_RENDER_EXTERNAL_DATABASE_URL
+```
+
+The C++ application does not automatically read `.env` files. Load it into your shell before running the app:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+## Build and run locally
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra main.cpp -lpq -o market_app
 ./market_app
 ```
 
-Open http://localhost:8080. By default, data is stored in `data/market.db`.
+Open http://localhost:8080. The application creates its PostgreSQL tables automatically on first startup: `batches`, `orders`, and `deliveries`.
 
-You can override the SQLite file path:
-
-```bash
-DATABASE_PATH=/absolute/path/market.db ./market_app
-```
-
-## Use PostgreSQL locally or online
-
-When `DATABASE_URL` is set, the application uses PostgreSQL instead of SQLite. When it is absent, the app uses SQLite.
-
-```bash
-export DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require'
-./market_app
-```
-
-Use the connection string supplied by your database provider. Do not commit it to GitHub or place it in the Dockerfile.
-
-The app creates its three tables automatically on first connection: `batches`, `orders`, and `deliveries`.
+If `DATABASE_URL` is missing or the database connection fails, the application stops with an error. There is no local database fallback.
 
 ## Run with Docker
 
@@ -52,22 +60,12 @@ Build:
 docker build -t nakuru-market .
 ```
 
-Run locally with a persistent SQLite volume:
+Run against your PostgreSQL database:
 
 ```bash
 docker run --rm -p 8080:10000 \
   -e PORT=10000 \
-  -e DATABASE_PATH=/app/data/market.db \
-  -v nakuru-market-data:/app/data \
-  nakuru-market
-```
-
-Or run the container against PostgreSQL:
-
-```bash
-docker run --rm -p 8080:10000 \
-  -e PORT=10000 \
-  -e DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require' \
+  -e DATABASE_URL='YOUR_POSTGRES_CONNECTION_URL' \
   nakuru-market
 ```
 
@@ -75,17 +73,15 @@ docker run --rm -p 8080:10000 \
 
 This repository includes a `render.yaml` Blueprint and a Dockerfile configured for Render's Free web service.
 
-1. In Render, open the PostgreSQL database you created.
-2. Copy its **Internal Database URL** if the web service is in the same Render region. If it is in a different region, use the External Database URL.
+1. Open your Render PostgreSQL database.
+2. Copy its **Internal Database URL** (use this when the web service is in the same Render region).
 3. Open the Nakuru web service → **Environment**.
-4. Add an environment variable:
+4. Confirm this environment variable exists:
    - **Key:** `DATABASE_URL`
-   - **Value:** paste the PostgreSQL connection URL from Render.
-5. Save changes and trigger a deploy if Render does not automatically redeploy.
+   - **Value:** your Render PostgreSQL Internal Database URL.
+5. Save changes and deploy.
 
 Do not add the connection URL to the Dockerfile, `render.yaml`, source code, or GitHub. Render injects environment variables into the running service.
-
-The app checks for `DATABASE_URL` at startup. If it is set, it connects to PostgreSQL; otherwise it falls back to local SQLite. The Render database URL should include SSL settings if Render provides them. Render's own connection URL is the source of truth.
 
 The web service listens on Render's assigned `PORT` and exposes `/healthz` as its health check.
 
@@ -97,8 +93,7 @@ The web service listens on Render's assigned `PORT` and exposes `/healthz` as it
 - Driver dispatch and delivery manifest
 - Spoilage / low-stock alerts
 - Daily sales summary
-- PostgreSQL persistence when `DATABASE_URL` is set
-- SQLite persistence for local development by default
+- PostgreSQL persistence for both local development and production
 - `GET /healthz` health-check endpoint
 
 ## API routes
